@@ -1,0 +1,262 @@
+.TH FBHALF 1 "2026-04-27" "fbhalf 0.1.0" "ユーザーコマンド"
+.ad l
+.SH 名前
+fbhalf \- Linux フレームバッファ用 画像ビューア (PNG/JPEG)
+.SH 書式
+.B fbhalf
+.RI [ "\-\-display" "[=" CONNECTOR "]]"
+.RI [ region ]
+.I file.{png,jpg}
+.RI [ file2.png \ ...]
+.br
+.B fbhalf
+.SH 説明
+.B fbhalf
+は Linux のフレームバッファデバイス
+.RI ( /dev/fb0 )
+に PNG 画像を直接描画するビューアです。
+画面を左右・四分割した領域を指定して表示するほか、
+.B auto
+モードで tmux ペインの位置を自動検出して配置することもできます。
+.PP
+.B \-\-display
+オプションを指定すると、フレームバッファの代わりに DRM 経由で外部モニターへ
+直接描画します（詳細は
+.B 外部ディスプレイモード
+の節を参照）。
+.PP
+引数なしで起動した場合は、カレントディレクトリ内の
+.B *.{png,jpg}
+ファイルをアルファベット順に読み込み、
+.B auto
+モードで表示します。
+.PP
+.I region
+に認識できない文字列を指定した場合、またはファイル名のみを渡した場合は
+.B auto
+として扱われます。
+.SH オプション
+.TP
+.RI "\-\-display[=" CONNECTOR ]
+外部モニターに DRM 経由で出力します。
+.I CONNECTOR
+を省略した場合は
+.B DP-1
+を使用します。詳細は
+.B 外部ディスプレイモード
+の節を参照してください。
+.TP
+.I region
+描画先の画面領域を指定します。以下のいずれかを指定してください。
+.RS
+.TP
+.B full
+画面全体。
+.TP
+.B left
+画面の左半分。
+.TP
+.B right
+画面の右半分。
+.TP
+.BR topleft ,\ tl
+画面の左上 1/4。
+.TP
+.BR topright ,\ tr
+画面の右上 1/4。
+.TP
+.BR bottomleft ,\ bl
+画面の左下 1/4。
+.TP
+.BR bottomright ,\ br
+画面の右下 1/4。
+.TP
+.B auto
+tmux ペイン位置を自動検出し、対応するピクセル領域に描画します。
+環境変数
+.B TMUX
+が設定されていない場合は動作しません。
+.RE
+.SH キー操作
+.TP
+.BR n ,\ Space
+次の画像へ。
+.TP
+.BR p ,\ b ,\ Backspace
+前の画像へ。
+.TP
+.BR + ,\ =
+ズームイン（最大 800%）。
+.TP
+.B \-
+ズームアウト（最小 10%）。
+.TP
+.B 0
+ズームとパンをリセット。
+.TP
+.BR h ,\ \(la
+左にパン。
+.TP
+.BR l ,\ \(ra
+右にパン。
+.TP
+.BR k ,\ \(ua
+上にパン。
+.TP
+.BR j ,\ \(da
+下にパン。
+.TP
+.BI : N \fR\ Enter
+N ページ目へジャンプ（1 始まり）。
+.TP
+.BI :p \ Enter
+現在のページ番号とファイル名を表示。
+.TP
+.BR q ,\ Esc ,\ Ctrl\-c
+終了。終了時に描画領域を黒でクリアします。
+.SH auto モード
+.PP
+auto モードでは \fBtmux display\-message \-p\fR でカレントペインのセル座標
+（左端列、上端行、幅、高さ）を取得します。
+フレームバッファの解像度とウィンドウ文字数から
+1 セルあたりのピクセル数を計算して描画領域を決定します。
+.PP
+500 ms ごとにペイン情報を再取得し、以下のいずれかが起きると自動再描画します。
+.IP \[bu] 2
+ペインのサイズや位置が変化した。
+.IP \[bu]
+他プロセス（fbterm など）がフレームバッファを上書きした（センチネル検出）。
+.PP
+別の tmux ウィンドウにフォーカスが移っている間は描画を停止します。
+.SH 外部ディスプレイモード
+.PP
+.RI "\-\-display[=" CONNECTOR "]"
+を指定すると、内蔵フレームバッファの代わりに DRM 経由で外部モニターへ
+直接描画します。
+.I CONNECTOR
+は接続先のコネクタ名（例:
+.BR DP-1 ", " HDMI-A-1
+）で、省略時は
+.B DP-1
+が使われます。
+.PP
+描画先となる共有メモリ
+.RB ( /tmp/fbhalf-ext )
+の info ファイルが存在しない場合、fbhalf は付属のヘルパー
+.B fbhalf-drm-output
+を
+.B sudo
+経由で自動起動し、info ファイルが現れるまで待機します
+（パスワード入力を求められることがあります）。
+ヘルパーは fbhalf と同じディレクトリ、または
+.B PATH
+上から検索されます。見つからない場合はビルド方法を案内するエラーで終了します。
+.PP
+ヘルパーは指定したコネクタに対して DRM の dumb buffer を確保して
+モード設定を行い、共有メモリの内容を約 60fps でモニターへ転送し続けます。
+fbhalf 自身は通常モードと同じ描画ロジックで、書き込み先を
+.B /dev/fb0
+から共有メモリに切り替えるだけです。
+.PP
+ヘルパーのビルド:
+.RS
+.EX
+make
+sudo install \-m 755 fbhalf\-drm\-output /usr/local/bin/
+.EE
+.RE
+.SH 環境変数
+.TP
+.B TMUX
+tmux セッション内であることを示す変数。設定されていない場合、
+.B auto
+モードは利用できません。
+.TP
+.B TMUX_PANE
+カレントペインの ID（例: %3）。
+auto モードで自ペインを特定するために使用します。
+.SH ファイル
+.TP
+.B /dev/fb0
+描画先のフレームバッファデバイス。読み書き権限が必要です（通常は
+.B video
+グループへの追加で対応できます）。
+.TP
+.B /sys/class/graphics/fb0/virtual_size
+フレームバッファの解像度取得に使用。
+.TP
+.B /sys/class/graphics/fb0/bits_per_pixel
+フレームバッファの色深度取得に使用。
+.TP
+.B /sys/class/graphics/fb0/stride
+フレームバッファの行バイト数取得に使用。
+.TP
+.B /tmp/fbhalf\-ext
+.RB ( "\-\-display" " 使用時)"
+fbhalf\-drm\-output ヘルパーとの間で描画フレームをやり取りする共有メモリ。
+.TP
+.B /tmp/fbhalf\-ext.info
+.RB ( "\-\-display" " 使用時)"
+共有メモリの解像度・ストライド・サイズ情報を記録したファイル。
+存在しない場合、fbhalf はヘルパーを自動起動して生成を待ちます。
+.SH 使用例
+.PP
+カレントディレクトリの PNG をビューアで表示:
+.RS
+.EX
+fbhalf
+.EE
+.RE
+.PP
+画面右半分に 1 枚表示:
+.RS
+.EX
+fbhalf right screenshot.png
+.EE
+.RE
+.PP
+tmux 内で自動配置しながら複数枚を閲覧:
+.RS
+.EX
+fbhalf auto page-01.png page-02.png page-03.png
+.EE
+.RE
+.PP
+右上 1/4 領域に表示（短縮形）:
+.RS
+.EX
+fbhalf tr diagram.png
+.EE
+.RE
+.PP
+外部モニター (DP-1) 全画面に表示:
+.RS
+.EX
+fbhalf \-\-display full image.png
+.EE
+.RE
+.PP
+外部モニター DP-2 の左半分に複数枚表示:
+.RS
+.EX
+fbhalf \-\-display=DP-2 left a.png b.png
+.EE
+.RE
+.SH 終了ステータス
+.TP
+.B 0
+正常終了。
+.TP
+.B 1
+引数エラーまたは初期化失敗（フレームバッファが読めない場合など）。
+.SH 注意
+16bpp・24bpp・32bpp のフレームバッファに対応しています。
+インデックスカラーの PNG には対応していません。
+.PP
+スケーリングはニアレストネイバー法で行われます。
+.SH 著者
+shurto11
+.SH 関連項目
+.BR fbset (8),
+.BR tmux (1),
+.BR fbi (1)
