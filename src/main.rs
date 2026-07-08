@@ -164,7 +164,7 @@ struct TmuxInfo {
 fn tmux_info(fb: &FbInfo, pane_id: &str) -> Option<TmuxInfo> {
     // $TMUX が未設定でも tmux サーバーが動いていれば検出できるよう、
     // env var ガードを外して終了コードで判断する
-    let fmt = "#{window_active},#{pane_left},#{pane_top},#{pane_width},#{pane_height},#{window_width},#{window_height}";
+    let fmt = "#{window_active},#{pane_left},#{pane_top},#{pane_width},#{pane_height},#{window_width},#{window_height},#{client_width},#{client_height},#{status-position}";
     let mut cmd = std::process::Command::new("tmux");
     cmd.arg("display-message").arg("-p");
     if !pane_id.is_empty() {
@@ -177,27 +177,41 @@ fn tmux_info(fb: &FbInfo, pane_id: &str) -> Option<TmuxInfo> {
         return None;
     }
     let s = String::from_utf8(out.stdout).ok()?;
-    let nums: Vec<u32> = s.trim().split(',')
+    let parts: Vec<&str> = s.trim().split(',').collect();
+    if parts.len() < 7 {
+        return None;
+    }
+    let nums: Vec<u32> = parts[..7].iter()
         .map(|v| v.trim().parse::<u32>().ok())
         .collect::<Option<Vec<u32>>>()?;
 
-    if nums.len() < 7 {
-        return None;
-    }
     let (active, pane_left, pane_top, pane_w, pane_h, win_w, win_h) =
         (nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6]);
 
     if win_w == 0 || win_h == 0 {
         return None;
     }
-    let cell_w = fb.width  / win_w;
-    let cell_h = fb.height / win_h;
+    // セルサイズはステータスバーを含む端末全体の行列数から求める
+    // (window_height はステータスバー分小さいため、それで割るとセルが過大になり
+    //  描画がステータスバー行に食い込む)
+    let client_w = parts.get(7).and_then(|v| v.trim().parse::<u32>().ok()).filter(|&v| v > 0);
+    let client_h = parts.get(8).and_then(|v| v.trim().parse::<u32>().ok()).filter(|&v| v > 0);
+    let status_pos = parts.get(9).map(|v| v.trim()).unwrap_or("bottom");
+    let cols = client_w.unwrap_or(win_w);
+    let rows = client_h.unwrap_or(win_h);
+    let cell_w = fb.width  / cols;
+    let cell_h = fb.height / rows;
+
+    // ステータスバー行数 = 端末全体の行数 - ウィンドウの行数。
+    // pane_top はウィンドウ内相対なので、上部ステータスバーの場合はその分下へずらす。
+    let status_rows = rows.saturating_sub(win_h);
+    let y_off = if status_pos == "top" { status_rows * cell_h } else { 0 };
 
     Some(TmuxInfo {
         window_active: active == 1,
         reg: DrawRegion {
             x: pane_left * cell_w,
-            y: pane_top  * cell_h,
+            y: y_off + pane_top * cell_h,
             w: pane_w    * cell_w,
             h: pane_h    * cell_h,
         },
