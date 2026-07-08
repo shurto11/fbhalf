@@ -3,7 +3,12 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod touch;
+use touch::TouchAction;
 
 // ── 外部ディスプレイ (DRM) 出力 ───────────────────────────────────────────────
 
@@ -498,8 +503,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     viewer.render(&mut fb)?;
 
+    // touch-server クライアントを起動(現在の描画領域を共有し、変化したら再申告させる)
+    let touch_region = Arc::new(Mutex::new(viewer.reg));
+    let touch_rx = touch::spawn(
+        touch_region.clone(),
+        viewer.fb_info.width as f64,
+        viewer.fb_info.height as f64,
+    );
+
     enable_raw_mode()?;
-    let result = run_loop(&mut viewer, &mut fb);
+    let result = run_loop(&mut viewer, &mut fb, &touch_region, &touch_rx);
     disable_raw_mode()?;
 
     let _ = clear_region(&mut fb, &viewer.fb_info, viewer.reg);
@@ -567,6 +580,8 @@ fn cmd_prompt_clear() {
 fn run_loop(
     viewer: &mut Viewer,
     fb: &mut std::fs::File,
+    touch_region: &Arc<Mutex<DrawRegion>>,
+    touch_rx: &Receiver<TouchAction>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tmux_check = Instant::now();
     let tmux_interval = Duration::from_millis(500);
@@ -590,13 +605,40 @@ fn run_loop(
                     if region_changed {
                         clear_region(fb, &viewer.fb_info, viewer.reg)?;
                         viewer.reg = info.reg;
+                        // touch-client に新しい描画領域を伝える(再申告させる)
+                        *touch_region.lock().unwrap() = info.reg;
                     }
                     viewer.render(fb)?;
                 }
             }
         }
 
-        if !event::poll(Duration::from_millis(200))? {
+        // タッチ操作を処理(複数イベントをまとめて 1 回の再描画に集約)
+        {
+            let mut pan = (0i32, 0i32);
+            let mut zoom_factor = 1.0f32;
+            let mut touched = false;
+            while let Ok(action) = touch_rx.try_recv() {
+                touched = true;
+                match action {
+                    TouchAction::ZoomFactor(f) => zoom_factor *= f,
+                    TouchAction::PanBy(dx, dy) => {
+                        pan.0 += dx;
+                        pan.1 += dy;
+                    }
+                    TouchAction::NextPage => viewer.next(),
+                    TouchAction::PrevPage => viewer.prev(),
+                }
+            }
+            if touched {
+                viewer.zoom = (viewer.zoom * zoom_factor).clamp(0.1, 8.0);
+                viewer.pan_x += pan.0;
+                viewer.pan_y += pan.1;
+                viewer.render(fb)?;
+            }
+        }
+
+        if !event::poll(Duration::from_millis(40))? {
             continue;
         }
         let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? else {
