@@ -7,6 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod fb_client;
 mod touch;
 use touch::TouchAction;
 
@@ -135,6 +136,12 @@ struct DrawRegion {
     y: u32,
     w: u32,
     h: u32,
+}
+
+impl DrawRegion {
+    fn to_rect(self) -> fb_client::Rect {
+        fb_client::Rect { x: self.x, y: self.y, w: self.w, h: self.h }
+    }
 }
 
 fn parse_region(spec: &str, fb: &FbInfo) -> Option<DrawRegion> {
@@ -267,17 +274,68 @@ fn scale_nearest(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> 
     dst
 }
 
+/// 領域 `reg` の絶対行 `abs_y` について、`clip`(描画禁止矩形)を避けて書くべき
+/// ローカル列スパン `[start, end)` の一覧を返す。clip に掛からなければ
+/// `[(0, reg.w)]`、全面が掛かれば空。区間が重なっても正しくマージする。
+fn unclipped_spans(reg: DrawRegion, abs_y: u32, clip: &[fb_client::Rect]) -> Vec<(u32, u32)> {
+    // この行に掛かる clip をローカル列区間 [s, e) に変換(開始順にソート)。
+    let mut skips: Vec<(u32, u32)> = clip
+        .iter()
+        .filter(|c| abs_y >= c.y && abs_y < c.y + c.h)
+        .filter_map(|c| {
+            let x0 = c.x.max(reg.x);
+            let x1 = (c.x + c.w).min(reg.x + reg.w);
+            (x1 > x0).then(|| (x0 - reg.x, x1 - reg.x))
+        })
+        .collect();
+    skips.sort_unstable();
+
+    let mut spans = Vec::new();
+    let mut col = 0u32;
+    for (s, e) in skips {
+        if col < s {
+            spans.push((col, s));
+        }
+        col = col.max(e);
+    }
+    if col < reg.w {
+        spans.push((col, reg.w));
+    }
+    spans
+}
+
+/// 領域内の1行 `row_buf`(幅 reg.w ぶん)を、`clip`(描画禁止矩形)に掛かる
+/// 列を避けてフレームバッファへ書き込む。clip 内のピクセルは上位レイヤーが
+/// 描くので、こちらは触らない。
+fn write_row_masked(
+    fb: &mut std::fs::File,
+    fb_info: &FbInfo,
+    reg: DrawRegion,
+    fb_row: u32,
+    row_buf: &[u8],
+    clip: &[fb_client::Rect],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bpp = (fb_info.bpp / 8) as usize;
+    let abs_y = reg.y + fb_row;
+    let base = abs_y as u64 * fb_info.stride as u64 + reg.x as u64 * bpp as u64;
+
+    for (s, e) in unclipped_spans(reg, abs_y, clip) {
+        fb.seek(SeekFrom::Start(base + s as u64 * bpp as u64))?;
+        fb.write_all(&row_buf[s as usize * bpp..e as usize * bpp])?;
+    }
+    Ok(())
+}
+
 fn clear_region(
     fb: &mut std::fs::File,
     fb_info: &FbInfo,
     reg: DrawRegion,
+    clip: &[fb_client::Rect],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bpp = (fb_info.bpp / 8) as usize;
     let black = vec![0u8; reg.w as usize * bpp];
     for row in 0..reg.h {
-        let off = (reg.y + row) as u64 * fb_info.stride as u64 + reg.x as u64 * bpp as u64;
-        fb.seek(SeekFrom::Start(off))?;
-        fb.write_all(&black)?;
+        write_row_masked(fb, fb_info, reg, row, &black, clip)?;
     }
     Ok(())
 }
@@ -293,6 +351,7 @@ fn blit(
     dst_y: i32,
     src_x: i32,
     src_y: i32,
+    clip: &[fb_client::Rect],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bpp = (fb_info.bpp / 8) as usize;
     let mut row_buf = vec![0u8; reg.w as usize * bpp];
@@ -325,10 +384,7 @@ fn blit(
                 _ => {}
             }
         }
-        let off = (reg.y as i32 + fb_row) as u64 * fb_info.stride as u64
-            + reg.x as u64 * bpp as u64;
-        fb.seek(SeekFrom::Start(off))?;
-        fb.write_all(&row_buf)?;
+        write_row_masked(fb, fb_info, reg, fb_row as u32, &row_buf, clip)?;
     }
     Ok(())
 }
@@ -349,6 +405,9 @@ struct Viewer {
     pane_id: String,
     /// 描画後に保存したフレームバッファの先頭部分。fbterm上書き検出に使う。
     sentinel: Vec<u8>,
+    /// fb-server から通知された描画禁止矩形。上位レイヤーとの重なり領域で、
+    /// ここは描かない(上位レイヤーが描くのでチカチカ防止)。
+    clip: Vec<fb_client::Rect>,
 }
 
 impl Viewer {
@@ -391,7 +450,7 @@ impl Viewer {
         let src_x = if scaled_w > reg.w { self.pan_x } else { 0 };
         let src_y = if scaled_h > reg.h { self.pan_y } else { 0 };
 
-        blit(fb, &scaled, scaled_w, scaled_h, &self.fb_info, reg, dst_x, dst_y, src_x, src_y)?;
+        blit(fb, &scaled, scaled_w, scaled_h, &self.fb_info, reg, dst_x, dst_y, src_x, src_y, &self.clip)?;
         fb.flush()?;
         self.sentinel = read_sentinel(fb, &self.fb_info, reg);
 
@@ -511,6 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         auto_track,
         pane_id,
         sentinel: Vec::new(),
+        clip: Vec::new(),
     };
 
     let mut fb = std::fs::OpenOptions::new().read(true).write(true).open(&fb_path)?;
@@ -525,11 +585,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewer.fb_info.height as f64,
     );
 
+    // fb-server クライアント起動(表示可否 + 描画禁止矩形の通知を受け取る)。
+    // 現在の描画領域を共有し、auto 追従で変わったら再申告させる。
+    let fb_rect = Arc::new(Mutex::new(Some(viewer.reg.to_rect())));
+    let (vtx, vrx) = std::sync::mpsc::channel::<fb_client::VisMsg>();
+    fb_client::spawn("fbhalf", fb_rect.clone(), vtx);
+
     enable_raw_mode()?;
-    let result = run_loop(&mut viewer, &mut fb, &touch_region, &touch_rx);
+    let result = run_loop(&mut viewer, &mut fb, &touch_region, &fb_rect, &touch_rx, &vrx);
     disable_raw_mode()?;
 
-    let _ = clear_region(&mut fb, &viewer.fb_info, viewer.reg);
+    let _ = clear_region(&mut fb, &viewer.fb_info, viewer.reg, &viewer.clip);
     if !viewer.auto_track {
         eprintln!();
     }
@@ -595,15 +661,34 @@ fn run_loop(
     viewer: &mut Viewer,
     fb: &mut std::fs::File,
     touch_region: &Arc<Mutex<DrawRegion>>,
+    fb_rect: &Arc<Mutex<Option<fb_client::Rect>>>,
     touch_rx: &Receiver<TouchAction>,
+    vrx: &Receiver<fb_client::VisMsg>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tmux_check = Instant::now();
     let tmux_interval = Duration::from_millis(500);
     let mut cmd_mode = false;
     let mut cmd_buf = String::new();
+    let mut visible = true;
 
     loop {
-        // tmux ペイン追跡（auto モード時のみ）
+        // fb-server からの可視性 + 描画禁止矩形(clip)を反映。非表示に変わった
+        // 瞬間だけ領域をクリアし、以降 visible=false の間は render() を呼ばない。
+        // clip が変わったら(上位レイヤーの出入り/移動)再描画して差分を反映する。
+        while let Ok(msg) = vrx.try_recv() {
+            let clip_changed = viewer.clip != msg.clip;
+            viewer.clip = msg.clip;
+            if visible && !msg.visible {
+                let _ = clear_region(fb, &viewer.fb_info, viewer.reg, &viewer.clip);
+            }
+            let became_visible = !visible && msg.visible;
+            visible = msg.visible;
+            if visible && (became_visible || clip_changed) {
+                viewer.render(fb)?;
+            }
+        }
+
+        // tmux ペイン追跡(auto モード時のみ)
         if viewer.auto_track && last_tmux_check.elapsed() >= tmux_interval {
             last_tmux_check = Instant::now();
             if let Some(info) = tmux_info(&viewer.fb_info, &viewer.pane_id) {
@@ -617,12 +702,15 @@ fn run_loop(
 
                 if region_changed || overwritten {
                     if region_changed {
-                        clear_region(fb, &viewer.fb_info, viewer.reg)?;
+                        clear_region(fb, &viewer.fb_info, viewer.reg, &viewer.clip)?;
                         viewer.reg = info.reg;
-                        // touch-client に新しい描画領域を伝える(再申告させる)
+                        // touch-client / fb-server に新しい描画領域を伝える(再申告)
                         *touch_region.lock().unwrap() = info.reg;
+                        *fb_rect.lock().unwrap() = Some(info.reg.to_rect());
                     }
-                    viewer.render(fb)?;
+                    if visible {
+                        viewer.render(fb)?;
+                    }
                 }
             }
         }
@@ -648,7 +736,9 @@ fn run_loop(
                 viewer.zoom = (viewer.zoom * zoom_factor).clamp(0.1, 8.0);
                 viewer.pan_x += pan.0;
                 viewer.pan_y += pan.1;
-                viewer.render(fb)?;
+                if visible {
+                    viewer.render(fb)?;
+                }
             }
         }
 
@@ -720,9 +810,72 @@ fn run_loop(
             _ => { need_render = false; }
         }
 
-        if need_render {
+        if need_render && visible {
             viewer.render(fb)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reg(x: u32, y: u32, w: u32, h: u32) -> DrawRegion {
+        DrawRegion { x, y, w, h }
+    }
+    fn rect(x: u32, y: u32, w: u32, h: u32) -> fb_client::Rect {
+        fb_client::Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn no_clip_writes_full_row() {
+        let r = reg(100, 0, 200, 50);
+        assert_eq!(unclipped_spans(r, 10, &[]), vec![(0, 200)]);
+    }
+
+    #[test]
+    fn clip_outside_row_range_is_ignored() {
+        let r = reg(100, 0, 200, 50);
+        // clip は y=[60,70) にあり、行 abs_y=10 には掛からない
+        let clip = [rect(100, 60, 50, 10)];
+        assert_eq!(unclipped_spans(r, 10, &clip), vec![(0, 200)]);
+    }
+
+    #[test]
+    fn clip_in_middle_splits_row() {
+        let r = reg(100, 0, 200, 50); // 絶対 x=[100,300)
+        // clip 絶対 x=[150,180) → ローカル [50,80)
+        let clip = [rect(150, 0, 30, 50)];
+        assert_eq!(unclipped_spans(r, 0, &clip), vec![(0, 50), (80, 200)]);
+    }
+
+    #[test]
+    fn clip_covering_whole_row_leaves_nothing() {
+        let r = reg(100, 0, 200, 50);
+        let clip = [rect(0, 0, 1000, 50)];
+        assert_eq!(unclipped_spans(r, 0, &clip), Vec::<(u32, u32)>::new());
+    }
+
+    #[test]
+    fn clip_at_left_edge() {
+        let r = reg(100, 0, 200, 50);
+        // 絶対 x=[100,140) → ローカル [0,40)
+        let clip = [rect(80, 0, 60, 50)];
+        assert_eq!(unclipped_spans(r, 0, &clip), vec![(40, 200)]);
+    }
+
+    #[test]
+    fn overlapping_clips_are_merged() {
+        let r = reg(0, 0, 100, 10);
+        let clip = [rect(10, 0, 40, 10), rect(30, 0, 40, 10)]; // [10,50)∪[30,70)=[10,70)
+        assert_eq!(unclipped_spans(r, 0, &clip), vec![(0, 10), (70, 100)]);
+    }
+
+    #[test]
+    fn multiple_disjoint_clips() {
+        let r = reg(0, 0, 100, 10);
+        let clip = [rect(10, 0, 10, 10), rect(60, 0, 10, 10)];
+        assert_eq!(unclipped_spans(r, 0, &clip), vec![(0, 10), (20, 60), (70, 100)]);
+    }
 }
