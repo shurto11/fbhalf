@@ -60,7 +60,7 @@ fn ensure_drm_output_running(connector: &str) -> Result<(), Box<dyn std::error::
         "外部ディスプレイ出力を起動しています: sudo {} {} {} {}",
         helper.display(), connector, DRM_SHM_PATH, DRM_DEFAULT_DEVICE,
     );
-    std::process::Command::new("sudo")
+    let mut child = std::process::Command::new("sudo")
         .arg(&helper)
         .arg(connector)
         .arg(DRM_SHM_PATH)
@@ -69,6 +69,16 @@ fn ensure_drm_output_running(connector: &str) -> Result<(), Box<dyn std::error::
 
     let start = Instant::now();
     while !std::path::Path::new(&info_path).exists() {
+        // ヘルパーは成功すれば常駐し続けるので、終了した = 起動失敗。
+        // DRM マスターを他(drmterm など)が握っていると SetCrtc で落ちる。
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "{} が起動に失敗しました ({})。{} を drmterm など他のプロセスが使用中の可能性があります \
+                 (drmterm 上の tmux で fbhalf を起動すれば、--display なしでそのペインに表示します)",
+                DRM_HELPER_NAME, status, connector,
+            )
+            .into());
+        }
         if start.elapsed() > Duration::from_secs(10) {
             return Err("drm-output の起動待ちでタイムアウトしました".into());
         }
