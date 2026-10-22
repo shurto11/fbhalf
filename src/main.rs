@@ -7,6 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod drmterm;
 mod fb_client;
 mod touch;
 use touch::TouchAction;
@@ -144,7 +145,7 @@ impl DrawRegion {
     }
 }
 
-fn parse_region(spec: &str, fb: &FbInfo) -> Option<DrawRegion> {
+fn parse_region(spec: &str, fb: &FbInfo, ov: Option<&drmterm::Info>) -> Option<DrawRegion> {
     let fw = fb.width;
     let fh = fb.height;
     let hw = fw / 2;
@@ -157,7 +158,7 @@ fn parse_region(spec: &str, fb: &FbInfo) -> Option<DrawRegion> {
         "topright"    | "tr"  => Some(DrawRegion { x: hw, y: 0,  w: hw, h: hh }),
         "bottomleft"  | "bl"  => Some(DrawRegion { x: 0,  y: hh, w: hw, h: hh }),
         "bottomright" | "br"  => Some(DrawRegion { x: hw, y: hh, w: hw, h: hh }),
-        "auto"                => tmux_info(fb, &std::env::var("TMUX_PANE").unwrap_or_default()).map(|i| i.reg),
+        "auto"                => tmux_info(fb, &std::env::var("TMUX_PANE").unwrap_or_default(), ov).map(|i| i.reg),
         _                     => None,
     }
 }
@@ -165,15 +166,22 @@ fn parse_region(spec: &str, fb: &FbInfo) -> Option<DrawRegion> {
 struct TmuxInfo {
     window_active: bool,
     reg: DrawRegion,
+    session: String,
 }
 
-/// tmux のペイン情報を取得する（ウィンドウアクティブ状態 + ピクセル座標）
-fn tmux_info(fb: &FbInfo, pane_id: &str) -> Option<TmuxInfo> {
+/// tmux のペイン情報を取得する（ウィンドウアクティブ状態 + ピクセル座標）。
+/// drmterm 配下(`ov`)では、セル寸法は drmterm が教える実寸を使い、端末全体の
+/// 行列数は drmterm 上の tmux クライアントのものを使う。
+fn tmux_info(fb: &FbInfo, pane_id: &str, ov: Option<&drmterm::Info>) -> Option<TmuxInfo> {
     // $TMUX が未設定でも tmux サーバーが動いていれば検出できるよう、
     // env var ガードを外して終了コードで判断する
-    let fmt = "#{window_active},#{pane_left},#{pane_top},#{pane_width},#{pane_height},#{window_width},#{window_height},#{client_width},#{client_height},#{status-position}";
+    let fmt = "#{window_active},#{pane_left},#{pane_top},#{pane_width},#{pane_height},#{window_width},#{window_height},#{client_width},#{client_height},#{status-position},#{client_tty},#{session_name}";
+    let client = ov.and_then(|o| o.client_tty());
     let mut cmd = std::process::Command::new("tmux");
     cmd.arg("display-message").arg("-p");
+    if let Some(c) = client {
+        cmd.arg("-c").arg(c);
+    }
     if !pane_id.is_empty() {
         cmd.arg("-t").arg(pane_id);
     }
@@ -184,7 +192,7 @@ fn tmux_info(fb: &FbInfo, pane_id: &str) -> Option<TmuxInfo> {
         return None;
     }
     let s = String::from_utf8(out.stdout).ok()?;
-    let parts: Vec<&str> = s.trim().split(',').collect();
+    let parts: Vec<&str> = s.trim().splitn(12, ',').collect();
     if parts.len() < 7 {
         return None;
     }
@@ -204,10 +212,24 @@ fn tmux_info(fb: &FbInfo, pane_id: &str) -> Option<TmuxInfo> {
     let client_w = parts.get(7).and_then(|v| v.trim().parse::<u32>().ok()).filter(|&v| v > 0);
     let client_h = parts.get(8).and_then(|v| v.trim().parse::<u32>().ok()).filter(|&v| v > 0);
     let status_pos = parts.get(9).map(|v| v.trim()).unwrap_or("bottom");
+    let client_tty = parts.get(10).copied().unwrap_or("");
+    let session = parts.get(11).unwrap_or(&"").to_string();
     let cols = client_w.unwrap_or(win_w);
-    let rows = client_h.unwrap_or(win_h);
-    let cell_w = fb.width  / cols;
-    let cell_h = fb.height / rows;
+    let (cell_w, cell_h, rows) = match ov {
+        // client_* は -c のクライアントがこのセッションを表示していなければ別の
+        // クライアントの値になるので、そのときは実セル高から行数を割り出す
+        Some(o) => {
+            let rows = match client_h {
+                Some(h) if client == Some(client_tty) => h,
+                _ => fb.height / o.cell_h,
+            };
+            (o.cell_w, o.cell_h, rows)
+        }
+        None => {
+            let rows = client_h.unwrap_or(win_h);
+            (fb.width / cols, fb.height / rows, rows)
+        }
+    };
 
     // ステータスバー行数 = 端末全体の行数 - ウィンドウの行数。
     // pane_top はウィンドウ内相対なので、上部ステータスバーの場合はその分下へずらす。
@@ -222,6 +244,7 @@ fn tmux_info(fb: &FbInfo, pane_id: &str) -> Option<TmuxInfo> {
             w: pane_w    * cell_w,
             h: pane_h    * cell_h,
         },
+        session,
     })
 }
 
@@ -408,6 +431,8 @@ struct Viewer {
     /// fb-server から通知された描画禁止矩形。上位レイヤーとの重なり領域で、
     /// ここは描かない(上位レイヤーが描くのでチカチカ防止)。
     clip: Vec<fb_client::Rect>,
+    /// drmterm のペインへ描いているときの接続。書き込み先は drmterm の共有メモリ。
+    overlay: Option<drmterm::Overlay>,
 }
 
 impl Viewer {
@@ -453,6 +478,10 @@ impl Viewer {
         blit(fb, &scaled, scaled_w, scaled_h, &self.fb_info, reg, dst_x, dst_y, src_x, src_y, &self.clip)?;
         fb.flush()?;
         self.sentinel = read_sentinel(fb, &self.fb_info, reg);
+        // drmterm は共有メモリを勝手には見に来ないので、書いたら再描画を促す
+        if let Some(ov) = self.overlay.as_mut() {
+            ov.frame();
+        }
 
         if !self.auto_track {
             eprint!(
@@ -468,6 +497,14 @@ impl Viewer {
     fn zoom_in(&mut self)  { self.zoom = (self.zoom + Self::ZOOM_STEP).min(8.0); }
     fn zoom_out(&mut self) { self.zoom = (self.zoom - Self::ZOOM_STEP).max(0.1); }
     fn reset_view(&mut self) { self.zoom = 1.0; self.pan_x = 0; self.pan_y = 0; }
+
+    /// drmterm へ現在の描画領域を重ねるよう申告する(show=false で取り下げ)。
+    fn sync_overlay_rect(&mut self, show: bool) {
+        let r = self.reg;
+        if let Some(ov) = self.overlay.as_mut() {
+            ov.set_rect(show.then_some((r.x, r.y, r.w, r.h)));
+        }
+    }
 }
 
 // ── エントリポイント ──────────────────────────────────────────────────────────
@@ -506,10 +543,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let (fb_info, fb_path): (FbInfo, String) = match &display_connector {
-        Some(connector) => setup_display_output(connector)?,
-        None => (FbInfo::read()?, "/dev/fb0".to_string()),
+    // drmterm(外部モニター)の中で起動されたなら、そのペインへ描く。
+    // drmterm が DRM マスターを握っているので --display のヘルパーは使えないし、
+    // 既に外部モニターに出ているので不要。
+    let overlay = drmterm::connect();
+    let (fb_info, fb_path): (FbInfo, String) = match (&overlay, &display_connector) {
+        (Some(ov), _) => (
+            FbInfo { width: ov.info.width, height: ov.info.height, bpp: 32, stride: ov.info.stride * 4 },
+            ov.info.fb.clone(),
+        ),
+        (None, Some(connector)) => setup_display_output(connector)?,
+        (None, None) => (FbInfo::read()?, "/dev/fb0".to_string()),
     };
+    let ov_info = overlay.as_ref().map(|o| o.info.clone());
 
     // 引数なし → カレントディレクトリの *.{png,jpg,jpeg} を auto で開く
     let (region_str, mut files): (&str, Vec<String>) = if args.len() == 1 {
@@ -525,7 +571,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             usage();
         }
         ("auto", imgs)
-    } else if args.len() >= 2 && parse_region(&args[1], &fb_info).is_some() {
+    } else if args.len() >= 2 && parse_region(&args[1], &fb_info, ov_info.as_ref()).is_some() {
         if args.len() < 3 { usage(); }
         (&args[1], args[2..].to_vec())
     } else {
@@ -541,15 +587,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let auto_track = region_str == "auto";
     let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
-    let reg = parse_region(region_str, &fb_info).unwrap_or_else(|| {
+    let reg = parse_region(region_str, &fb_info, ov_info.as_ref()).unwrap_or_else(|| {
         eprintln!("不明なregion: {}", region_str);
         usage();
     });
 
     if !auto_track {
-        let target = match &display_connector {
-            Some(connector) => format!("外部ディスプレイ ({})", connector),
-            None => "フレームバッファ".to_string(),
+        let target = match (&ov_info, &display_connector) {
+            (Some(_), _) => "外部ディスプレイ (drmterm)".to_string(),
+            (None, Some(connector)) => format!("外部ディスプレイ ({})", connector),
+            (None, None) => "フレームバッファ".to_string(),
         };
         eprintln!(
             "{}: {}x{} {}bpp  描画領域: ({},{}) {}x{}px",
@@ -571,19 +618,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pane_id,
         sentinel: Vec::new(),
         clip: Vec::new(),
+        overlay,
     };
 
     let mut fb = std::fs::OpenOptions::new().read(true).write(true).open(&fb_path)?;
 
     viewer.render(&mut fb)?;
+    // tmux 配下なら、drmterm へ重ねるのはこのウィンドウが映っていると確かめてから(run_loop)
+    if viewer.pane_id.is_empty() {
+        viewer.sync_overlay_rect(true);
+    }
 
-    // touch-server クライアントを起動(現在の描画領域を共有し、変化したら再申告させる)
+    // touch-server クライアントを起動(現在の描画領域を共有し、変化したら再申告させる)。
+    // fb-server(/dev/fb0 の重なり調停)とタッチパネルは内蔵画面のものなので、
+    // drmterm 出力中は繋がない(受信側だけ作り、何も届かないチャネルにする)。
+    let on_drmterm = viewer.overlay.is_some();
     let touch_region = Arc::new(Mutex::new(viewer.reg));
-    let touch_rx = touch::spawn(
-        touch_region.clone(),
-        viewer.fb_info.width as f64,
-        viewer.fb_info.height as f64,
-    );
+    let touch_rx = if on_drmterm {
+        std::sync::mpsc::channel().1
+    } else {
+        touch::spawn(
+            touch_region.clone(),
+            viewer.fb_info.width as f64,
+            viewer.fb_info.height as f64,
+        )
+    };
 
     // fb-server クライアント起動(表示可否 + 描画禁止矩形の通知を受け取る)。
     // 現在の描画領域を共有し、auto 追従で変わったら再申告させる。
@@ -593,13 +652,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fb_rect = Arc::new(Mutex::new(Some(viewer.reg.to_rect())));
     let fb_pane = Some(viewer.pane_id.clone()).filter(|p| !p.is_empty() && display_connector.is_none());
     let (vtx, vrx) = std::sync::mpsc::channel::<fb_client::VisMsg>();
-    fb_client::spawn("fbhalf", fb_pane, fb_rect.clone(), vtx);
+    if !on_drmterm {
+        fb_client::spawn("fbhalf", fb_pane, fb_rect.clone(), vtx);
+    }
 
     enable_raw_mode()?;
     let result = run_loop(&mut viewer, &mut fb, &touch_region, &fb_rect, &touch_rx, &vrx);
     disable_raw_mode()?;
 
     let _ = clear_region(&mut fb, &viewer.fb_info, viewer.reg, &viewer.clip);
+    viewer.sync_overlay_rect(false);
     if !viewer.auto_track {
         eprintln!();
     }
@@ -669,7 +731,8 @@ fn run_loop(
     touch_rx: &Receiver<TouchAction>,
     vrx: &Receiver<fb_client::VisMsg>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut last_tmux_check = Instant::now();
+    // 初回はすぐ確かめる(drmterm へ重ねるのはその結果を見てから)
+    let mut last_tmux_check: Option<Instant> = None;
     let tmux_interval = Duration::from_millis(500);
     let mut cmd_mode = false;
     let mut cmd_buf = String::new();
@@ -695,19 +758,28 @@ fn run_loop(
             }
         }
 
-        // tmux ペイン追跡(auto モード時のみ)
-        if viewer.auto_track && last_tmux_check.elapsed() >= tmux_interval {
-            last_tmux_check = Instant::now();
-            if let Some(info) = tmux_info(&viewer.fb_info, &viewer.pane_id) {
-                // 別ウィンドウに切り替え中は描画しない
-                if !info.window_active {
+        // tmux ペイン追跡(auto モード時)。drmterm 出力中は fb-server の可視制御が
+        // 無いので、領域を固定していてもウィンドウ・セッションの切り替えは追う。
+        let on_drmterm = viewer.overlay.is_some() && !viewer.pane_id.is_empty();
+        if (viewer.auto_track || on_drmterm) && last_tmux_check.map_or(true, |t| t.elapsed() >= tmux_interval) {
+            last_tmux_check = Some(Instant::now());
+            let ov_info = viewer.overlay.as_ref().map(|o| o.info.clone());
+            if let Some(info) = tmux_info(&viewer.fb_info, &viewer.pane_id, ov_info.as_ref()) {
+                // drmterm 配下では、drmterm のクライアントが今もこのセッションを映しているかも見る
+                let shown = ov_info.as_ref().map_or(true, |o| drmterm::shows_session(&o.tty, &info.session));
+                // 別ウィンドウに切り替え中は描画しない(drmterm には重ねるのをやめさせる)
+                if !info.window_active || !shown {
+                    viewer.sync_overlay_rect(false);
                     continue;
                 }
-                let region_changed = info.reg != viewer.reg;
+                let region_changed = viewer.auto_track && info.reg != viewer.reg;
                 let overwritten = !viewer.sentinel.is_empty()
                     && read_sentinel(fb, &viewer.fb_info, viewer.reg) != viewer.sentinel;
+                // drmterm の共有メモリは他のクライアント(fbrowse など)と共用なので、
+                // 隠れている間に上書きされていてもいいよう戻ったら描き直す
+                let reshown = viewer.overlay.as_ref().is_some_and(|o| !o.shown());
 
-                if region_changed || overwritten {
+                if region_changed || overwritten || reshown {
                     if region_changed {
                         clear_region(fb, &viewer.fb_info, viewer.reg, &viewer.clip)?;
                         viewer.reg = info.reg;
@@ -717,6 +789,7 @@ fn run_loop(
                     }
                     if visible {
                         viewer.render(fb)?;
+                        viewer.sync_overlay_rect(true);
                     }
                 }
             }

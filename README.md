@@ -83,6 +83,15 @@ sudo install -m 755 fbhalf-drm-output /usr/local/bin/
 
 ヘルパーは fbhalf と同じディレクトリ、または `PATH` 上から検索されます。見つからない場合はビルド方法を案内するエラーで終了します。
 
+## drmterm 連携
+
+外部モニターを [drmterm](../../drmterm) が使っている間は、drmterm が DRM マスターを握っているため `--display` のヘルパーはモード設定できません（起動に失敗した旨のエラーで終了します）。代わりに **drmterm 上の tmux ペインで fbhalf を起動すると、`--display` なしでそのペイン（外部モニター）に描画します**。
+
+- drmterm のオーバーレイソケット（`$DRMTERM_OVERLAY_SOCK`、無ければ `$XDG_RUNTIME_DIR/drmterm-overlay.sock`）に接続し、`/dev/fb0` の代わりに drmterm の共有メモリへ書き込んで、描いた矩形を drmterm に重ねてもらいます。プロトコルは fbrowse と同じです
+- 環境変数が届いていない（tmux サーバが drmterm より先に起動した）場合は、drmterm 上の tmux クライアントが自分のセッションを表示しているかを確かめてから使います。fbterm 側から起動した fbhalf はこれまでどおり `/dev/fb0` に描きます
+- 別ウィンドウ・別セッションへ切り替えると重ねるのをやめ、戻ると描き直します（region を固定していても追従します）
+- fb-server とタッチ操作は内蔵画面のものなので、drmterm 出力中は使いません
+
 ### キー操作
 
 | キー | 動作 |

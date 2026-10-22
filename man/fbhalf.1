@@ -165,6 +165,25 @@ make
 sudo install \-m 755 fbhalf\-drm\-output /usr/local/bin/
 .EE
 .RE
+.SH drmterm 連携
+.PP
+外部モニターを
+.B drmterm
+が使っている間は DRM マスターを握られているため、
+.B \-\-display
+のヘルパーはモード設定できず、起動に失敗した旨のエラーで終了します。
+.PP
+代わりに drmterm 上の tmux ペインで fbhalf を起動すると、
+.B \-\-display
+なしでそのペイン（外部モニター）に描画します。drmterm のオーバーレイソケットに接続し、
+.B /dev/fb0
+の代わりに drmterm の共有メモリへ書き込んで、描いた矩形を drmterm に重ねてもらいます。
+fbterm 側から起動した場合はこれまでどおり
+.B /dev/fb0
+に描きます。
+.PP
+別の tmux ウィンドウ・セッションへ切り替えると重ねるのをやめ、戻ると描き直します。
+fb\-server とタッチ操作は内蔵画面のものなので、drmterm 出力中は使いません。
 .SH 環境変数
 .TP
 .B TMUX
@@ -175,6 +194,12 @@ tmux セッション内であることを示す変数。設定されていない
 .B TMUX_PANE
 カレントペインの ID（例: %3）。
 auto モードで自ペインを特定するために使用します。
+.TP
+.B DRMTERM_OVERLAY_SOCK
+drmterm のオーバーレイソケットのパス。drmterm が PTY の子に渡します。
+未設定なら
+.B $XDG_RUNTIME_DIR/drmterm\-overlay.sock
+を探します。
 .SH ファイル
 .TP
 .B /dev/fb0
