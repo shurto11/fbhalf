@@ -587,9 +587,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // fb-server クライアント起動(表示可否 + 描画禁止矩形の通知を受け取る)。
     // 現在の描画領域を共有し、auto 追従で変わったら再申告させる。
+    // /dev/fb0 に描くときは tmux ペインも申告し、このウィンドウを表示している
+    // 間だけ表示させる(別ウィンドウの fbrowse などに画面を譲る)。外部ディスプレイ
+    // (--display)は tmux の画面と重ならないので拘束しない。
     let fb_rect = Arc::new(Mutex::new(Some(viewer.reg.to_rect())));
+    let fb_pane = Some(viewer.pane_id.clone()).filter(|p| !p.is_empty() && display_connector.is_none());
     let (vtx, vrx) = std::sync::mpsc::channel::<fb_client::VisMsg>();
-    fb_client::spawn("fbhalf", fb_rect.clone(), vtx);
+    fb_client::spawn("fbhalf", fb_pane, fb_rect.clone(), vtx);
 
     enable_raw_mode()?;
     let result = run_loop(&mut viewer, &mut fb, &touch_region, &fb_rect, &touch_rx, &vrx);
@@ -675,10 +679,13 @@ fn run_loop(
         // fb-server からの可視性 + 描画禁止矩形(clip)を反映。非表示に変わった
         // 瞬間だけ領域をクリアし、以降 visible=false の間は render() を呼ばない。
         // clip が変わったら(上位レイヤーの出入り/移動)再描画して差分を反映する。
+        // reason="session"(別ウィンドウ/セッションへ切り替えた)ときは tmux が
+        // 既に画面を描き直しているのでクリアしない(新しいウィンドウの文字や、
+        // そこで表示を始めた fbrowse などを消してしまうため)。
         while let Ok(msg) = vrx.try_recv() {
             let clip_changed = viewer.clip != msg.clip;
             viewer.clip = msg.clip;
-            if visible && !msg.visible {
+            if visible && !msg.visible && msg.reason.as_deref() != Some("session") {
                 let _ = clear_region(fb, &viewer.fb_info, viewer.reg, &viewer.clip);
             }
             let became_visible = !visible && msg.visible;

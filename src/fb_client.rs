@@ -1,7 +1,10 @@
 //! fb-server クライアント。task-var/src/fb_client.rs を踏襲。
 //!
-//! 起動時に自分の名前("fbhalf")と描画領域(rect)を hello として申告し、
-//! サーバーから届く {"visible":bool, "clip":[...]} を呼び出し側へ渡す。
+//! 起動時に自分の名前("fbhalf")、tmux ペイン(pane)、描画領域(rect)を hello
+//! として申告し、サーバーから届く {"visible":bool, "reason":..., "clip":[...]}
+//! を呼び出し側へ渡す。pane を申告すると、そのペインが表示中のウィンドウに
+//! ある間だけ visible になる(別ウィンドウへ切り替えると reason="session" で
+//! 隠れ、fbhalf シーンも解除される)。
 //! `clip` は描画禁止矩形(自分より優先度が高い表示中クライアントとの重なり
 //! 領域)。呼び出し側はその矩形を避けて描画する。
 //! 描画領域が変わったら共有 rect を更新すると、次のポーリングで {"rect":...}
@@ -28,6 +31,9 @@ pub struct Rect {
 #[derive(Debug, Clone)]
 pub struct VisMsg {
     pub visible: bool,
+    /// visible=false の理由。"session" は自分のペインが tmux 上で表示されて
+    /// いないため(シーンによる非表示では None)。
+    pub reason: Option<String>,
     pub clip: Vec<Rect>,
 }
 
@@ -35,6 +41,8 @@ pub struct VisMsg {
 #[derive(Serialize)]
 struct Hello {
     hello: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rect: Option<Rect>,
 }
@@ -49,6 +57,8 @@ struct RectUpdate {
 #[derive(Deserialize)]
 struct RawVisible {
     visible: bool,
+    #[serde(default)]
+    reason: Option<String>,
     #[serde(default)]
     clip: Vec<Rect>,
 }
@@ -67,11 +77,18 @@ fn socket_path() -> String {
 }
 
 /// fb-client スレッドを起動する(detached)。切断・接続失敗時は再接続し続ける。
-/// `rect` は現在の描画領域(共有)。呼び出し側が更新すると次のポーリングで
-/// サーバーへ申告し直す。fb-server が未起動の間は既定で visible=true のまま。
-pub fn spawn(name: &'static str, rect: Arc<Mutex<Option<Rect>>>, tx: Sender<VisMsg>) {
+/// `pane` は申告する tmux ペインID(`$TMUX_PANE`)。None なら表示中ウィンドウに
+/// 関係なく扱われる。`rect` は現在の描画領域(共有)。呼び出し側が更新すると
+/// 次のポーリングでサーバーへ申告し直す。fb-server が未起動の間は既定で
+/// visible=true のまま。
+pub fn spawn(
+    name: &'static str,
+    pane: Option<String>,
+    rect: Arc<Mutex<Option<Rect>>>,
+    tx: Sender<VisMsg>,
+) {
     std::thread::spawn(move || loop {
-        if let Err(e) = session(name, &rect, &tx) {
+        if let Err(e) = session(name, &pane, &rect, &tx) {
             eprintln!("fbhalf: fb-server 接続待ち ({e})");
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -81,12 +98,13 @@ pub fn spawn(name: &'static str, rect: Arc<Mutex<Option<Rect>>>, tx: Sender<VisM
 /// 1接続ぶんの受信ループ。EOF / エラーで戻る(呼び出し側が張り直す)。
 fn session(
     name: &'static str,
+    pane: &Option<String>,
     rect: &Arc<Mutex<Option<Rect>>>,
     tx: &Sender<VisMsg>,
 ) -> std::io::Result<()> {
     let stream = UnixStream::connect(socket_path())?;
     let mut cur = *rect.lock().unwrap();
-    let hello = Hello { hello: name, rect: cur };
+    let hello = Hello { hello: name, pane: pane.clone(), rect: cur };
     let line = serde_json::to_string(&hello).unwrap_or_default();
     (&stream).write_all(format!("{line}\n").as_bytes())?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -108,7 +126,7 @@ fn session(
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let l: Vec<u8> = buf.drain(..=pos).collect();
                     if let Ok(v) = serde_json::from_slice::<RawVisible>(&l) {
-                        let msg = VisMsg { visible: v.visible, clip: v.clip };
+                        let msg = VisMsg { visible: v.visible, reason: v.reason, clip: v.clip };
                         if tx.send(msg).is_err() {
                             return Ok(());
                         }
