@@ -81,6 +81,9 @@ fn socket_path() -> String {
 /// 関係なく扱われる。`rect` は現在の描画領域(共有)。呼び出し側が更新すると
 /// 次のポーリングでサーバーへ申告し直す。fb-server が未起動の間は既定で
 /// visible=true のまま。
+///
+/// 失敗は表示しない: 呼び出し側は raw mode 中なので stderr に書くと改行が
+/// 崩れて画面に積み重なる(touch.rs と同じく静かにリトライする)。
 pub fn spawn(
     name: &'static str,
     pane: Option<String>,
@@ -88,9 +91,7 @@ pub fn spawn(
     tx: Sender<VisMsg>,
 ) {
     std::thread::spawn(move || loop {
-        if let Err(e) = session(name, &pane, &rect, &tx) {
-            eprintln!("fbhalf: fb-server 接続待ち ({e})");
-        }
+        let _ = session(name, &pane, &rect, &tx);
         std::thread::sleep(Duration::from_millis(500));
     });
 }
